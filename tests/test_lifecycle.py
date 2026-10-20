@@ -330,6 +330,41 @@ class LifecycleTests(unittest.TestCase):
                 lifecycle._proc_group_key_for_child(2, str(proc_root), own_pid=2), 12,
             )
 
+    def test_ps_membership_uses_trusted_ps_path_regardless_of_job_path(self):
+        own_pid = os.getpid()
+        own = subprocess.CompletedProcess(
+            ['/bin/ps'], 0, stdout='{}\n'.format(own_pid).encode('ascii'), stderr=b'',
+        )
+        table = subprocess.CompletedProcess(
+            ['/bin/ps'], 0,
+            stdout='{} 111 S\n4322 4321 S\n'.format(own_pid).encode('ascii'), stderr=b'',
+        )
+        with tempfile.TemporaryDirectory() as empty_bin, \
+                mock.patch.dict(os.environ, {'PATH': empty_bin}), \
+                mock.patch.object(lifecycle.subprocess, 'run', side_effect=[own, table]) as run:
+            members = lifecycle._ps_group_members(4321)
+        self.assertEqual(members, [4322])
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            self.assertEqual(call[0][0][0], '/bin/ps')
+
+    def test_exec_error_drain_returns_queued_message_without_waiting(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.set_blocking(read_fd, False)
+            # A live trampoline with nothing queued must not hold the guard in read().
+            self.assertEqual(lifecycle._drain_exec_error(read_fd), '')
+            os.write(write_fd, b'[Errno 2] missing\nexecutable')
+            os.close(write_fd)
+            write_fd = None
+            self.assertEqual(lifecycle._drain_exec_error(read_fd), '[Errno 2] missing executable')
+            # A successful exec closes the write end, which reads as no error at all.
+            self.assertEqual(lifecycle._drain_exec_error(read_fd), '')
+        finally:
+            os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
+
     @unittest.skipUnless(sys.platform.startswith('linux'), 'PID namespace integration requires Linux')
     def test_pid_namespace_cancellation_without_mount_proc(self):
         unshare = shutil.which('unshare')
@@ -754,6 +789,16 @@ print('state={} group_members={} proc_self={} pid={} proc_pid_matches={}'.format
         self.assertEqual(result['state'], 'done')
         self.assertEqual(pathlib.Path(result['stdout_path']).read_bytes(), b'')
         self.assert_group_gone(quiet)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'guard exec-error path is verified on Linux')
+    def test_missing_backend_executable_records_spawn_error_for_startup_failure(self):
+        job_id = self.launch({'spawn_error': True, 'echo_task': False})
+        result = self.wait(job_id)
+        self.assertEqual(result['state'], 'failed')
+        self.assertEqual(result['failure_reason'], 'startup')
+        attempt = self.db.attempts(job_id)[0]
+        self.assertIn('[Errno 2]', attempt['spawn_error'] or '')
+        self.assert_group_gone(job_id)
 
     def test_wait_timeout_leaves_quiet_job_running_until_cancelled(self):
         job_id = self.launch({'echo_task': False, 'delay': 30})
@@ -1936,7 +1981,9 @@ print('state={} group_members={} proc_self={} pid={} proc_pid_matches={}'.format
         finally:
             connection.execute('COMMIT')
             connection.close()
-        result = self.wait(job_id, timeout=8)
+        # Slow CI runners can spend several more seconds draining busy retries after the lock is released.
+        result = self.wait(job_id, timeout=20)
+        self.assertNotEqual(result, 'timeout', self.job(job_id))
         self.assertEqual(result['state'], 'done', result)
         self.assertEqual(result['backend_session_id'], 'contention-session')
         self.assertIsNone(result['failure_reason'])

@@ -11,6 +11,7 @@ class Invocation:
     cwd: str
     env_overrides: dict
     stdin_path: str = None
+    env_remove: tuple = ()
 
 
 @dataclass
@@ -37,6 +38,10 @@ class Adapter:
     name = None
 
     def validate(self, options):
+        return dict(options)
+
+    def resolve_launch(self, options):
+        # Called only for fresh jobs, after validate and before the job row is written.
         return dict(options)
 
     def prepare(self, job, artifacts, resume_session_id=None):
@@ -83,7 +88,9 @@ def registered_adapters():
 
 from .opencode import OpenCodeAdapter
 from .codex import CodexAdapter
+from .claude import ClaudeAdapter
 
 register_adapter(OpenCodeAdapter)
 register_adapter(CodexAdapter)
+register_adapter(ClaudeAdapter)
 

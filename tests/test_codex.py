@@ -135,6 +135,7 @@ capture = {
     'backend_env': {
         key: os.environ.get(key, '<unset>')
         for key in (
+            'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT',
             'RELAY_JOB_HOST', 'RELAY_JOB_CONVERSATION_ID', 'RELAY_JOB_STATE_DIR',
             'CLAUDE_CODE_SESSION_ID', 'CLAUDE_PLUGIN_DATA', 'PLUGIN_DATA',
             'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_HOME', 'OPENAI_API_KEY',
@@ -998,6 +999,15 @@ class CodexLifecycleTests(unittest.TestCase):
                             with self.assertRaisesRegex(ValueError, message):
                                 cli.cmd_resume(['parent-fixture', 'follow-up task'])
                             launch.assert_not_called()
+
+    def test_codex_execution_receives_claude_host_markers_unchanged(self):
+        environment = dict(self.base_env, CLAUDECODE='fixture', CLAUDE_CODE_ENTRYPOINT='fixture')
+        job_id = self.launch(session_id='codex-marker-thread', env=environment)
+        waited, job = self.wait(job_id)
+        self.assertEqual(waited.returncode, 0, waited.stderr)
+        captured = self.capture(job)
+        self.assertEqual(captured['backend_env']['CLAUDECODE'], 'fixture')
+        self.assertEqual(captured['backend_env']['CLAUDE_CODE_ENTRYPOINT'], 'fixture')
 
     def test_cli_rejects_opencode_only_flags_for_codex(self):
         for flag_args in (('--route', 'sub'), ('--zen',), ('--go',)):

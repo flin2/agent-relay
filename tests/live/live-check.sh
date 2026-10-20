@@ -11,28 +11,48 @@ live-check.sh — run bounded checks against an installed backend CLI.
 
 Usage:
     RELAY_LIVE_CHECKS=1 bash tests/live/live-check.sh --backend codex|opencode [--notify-thread UUID]
+    RELAY_LIVE_CHECKS=1 bash tests/live/live-check.sh --backend claude [--route sub|api] [--model MODEL]
     bash tests/live/live-check.sh --dry-run --backend codex|opencode [--notify-thread UUID]
+    bash tests/live/live-check.sh --dry-run --backend claude [--route sub|api] [--model MODEL]
 
 Live checks require RELAY_LIVE_CHECKS=1. --dry-run prints the planned commands and
 does not create files or invoke a backend. OpenCode uses the subscription route.
 --notify-thread is Codex-only and must name an idle thread that you control.
-The live run retains its isolated repository, state, and evidence under TMPDIR.
+--route (sub or api) and --model are Claude-only; they default to sub and haiku.
+Claude runs need the claude CLI on PATH. The live run retains its isolated
+repository, state, and evidence under TMPDIR.
 EOF
 }
 
 BACKEND=""
 NOTIFY_THREAD=""
+ROUTE=""
+ROUTE_GIVEN=0
+MODEL=""
+MODEL_GIVEN=0
 DRY_RUN=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --backend)
-            [ "$#" -ge 2 ] || { echo "error: --backend needs codex or opencode" >&2; exit 2; }
+            [ "$#" -ge 2 ] || { echo "error: --backend needs codex, opencode, or claude" >&2; exit 2; }
             BACKEND="$2"
             shift 2
             ;;
         --notify-thread)
             [ "$#" -ge 2 ] || { echo "error: --notify-thread needs a UUID" >&2; exit 2; }
             NOTIFY_THREAD="$2"
+            shift 2
+            ;;
+        --route)
+            [ "$#" -ge 2 ] || { echo "error: --route needs sub or api" >&2; exit 2; }
+            ROUTE="$2"
+            ROUTE_GIVEN=1
+            shift 2
+            ;;
+        --model)
+            [ "$#" -ge 2 ] || { echo "error: --model needs a model name" >&2; exit 2; }
+            MODEL="$2"
+            MODEL_GIVEN=1
             shift 2
             ;;
         --dry-run)
@@ -52,12 +72,35 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$BACKEND" in
-    codex|opencode) ;;
+    codex|opencode|claude) ;;
     *)
-        echo "error: pass the required --backend codex or --backend opencode" >&2
+        echo "error: pass the required --backend codex, opencode, or claude" >&2
         exit 2
         ;;
 esac
+
+if [ "$BACKEND" = "claude" ]; then
+    if [ "$ROUTE_GIVEN" -ne 1 ]; then
+        ROUTE="sub"
+    fi
+    case "$ROUTE" in
+        sub|api) ;;
+        *)
+            echo "error: --route must be sub or api" >&2
+            exit 2
+            ;;
+    esac
+    if [ "$MODEL_GIVEN" -ne 1 ]; then
+        MODEL="haiku"
+    fi
+    if [ -z "$MODEL" ]; then
+        echo "error: --model needs a non-empty model name" >&2
+        exit 2
+    fi
+elif [ "$ROUTE_GIVEN" -eq 1 ] || [ "$MODEL_GIVEN" -eq 1 ]; then
+    echo "error: --route and --model are available only with --backend claude" >&2
+    exit 2
+fi
 
 if [ -n "$NOTIFY_THREAD" ]; then
     if [ "$BACKEND" != "codex" ]; then
@@ -102,11 +145,11 @@ if [ "$DRY_RUN" -ne 1 ]; then
         echo "error: ps is required for the cancellation check" >&2
         exit 2
     fi
-    if [ "$BACKEND" = "codex" ]; then
-        BACKEND_CLI="codex"
-    else
-        BACKEND_CLI="opencode"
-    fi
+    case "$BACKEND" in
+        codex) BACKEND_CLI="codex" ;;
+        claude) BACKEND_CLI="claude" ;;
+        *) BACKEND_CLI="opencode" ;;
+    esac
     if ! command -v "$BACKEND_CLI" >/dev/null 2>&1; then
         echo "error: $BACKEND_CLI is not on PATH" >&2
         exit 2
@@ -133,6 +176,11 @@ STEP_RESULTS=(
     "SKIP (not reached)"
     "SKIP (not requested)"
 )
+if [ "$BACKEND" = "claude" ]; then
+    STEP_NAMES[6]="Claude stream-json event shape and identity"
+    STEP_NAMES+=("Claude read-only Git and subdirectory resume")
+    STEP_RESULTS+=("SKIP (not reached)")
+fi
 RUN_ROOT=""
 STATE_DIR=""
 PENDING_JOB_ID=""
@@ -149,8 +197,8 @@ show_summary() {
 }
 
 finish() {
-    local result index failures
-    result=$?
+    # Capture the exit status before local resets $?.
+    local result=$? index failures
     trap - EXIT
     if [ -n "$SQLITE_PID" ] && [ -n "$SQLITE_RELEASE" ]; then
         : > "$SQLITE_RELEASE" 2>/dev/null || true
@@ -342,27 +390,408 @@ sys.exit(3)
 
 SQLITE_LOCK_CODE='import os,sqlite3,sys,time; root,ready,release,job=sys.argv[1:]; connection=sqlite3.connect(os.path.join(root,"jobs.sqlite3"),timeout=5,isolation_level=None); connection.execute("PRAGMA journal_mode=WAL"); connection.execute("UPDATE jobs SET updated_at=updated_at WHERE id=?",(job,)); connection.execute("BEGIN"); connection.execute("SELECT id FROM jobs WHERE id=?",(job,)).fetchone(); open(ready,"w").close(); [time.sleep(.1) for _ in range(150) if not os.path.exists(release)]; connection.execute("ROLLBACK"); connection.close()'
 
+# Claude backend: probe tasks, stream-json parsers, and host-marker helpers.
+CLAUDE_PROBE_FILES=(readonly-probe.txt git-output-probe.txt redirect-probe.txt)
+CLAUDE_READONLY_TASK="Run each of these commands exactly with the shell in the job workspace, one at a time, even if you expect it to be denied, and report each exit code: 'touch readonly-probe.txt', then 'git diff --output=git-output-probe.txt HEAD', then 'git log --oneline -1 > redirect-probe.txt'. Report the exact command, exit code, stdout, and stderr for each."
+CLAUDE_ESSAY_TASK='Write a detailed 3000-word essay on the history of version control, then reply DONE.'
+CLAUDE_GIT_TASK="Run exactly these two shell commands, one at a time, with the shell in the job workspace, and report the output of each: 'git log --oneline -1', then 'git status --short'."
+CLAUDE_RESUME_GIT_TASK='Reply exactly RESUME_OK.'
+CLAUDE_STREAM_LIB='import json,re,sys
+WRITE_TOOLS=("Write","Edit","NotebookEdit")
+GIT_LOG=re.compile(r"(?:^|[\s;&|(])git\s+log(?:\s|$)")
+def read_stream(path):
+    uses=[]
+    results={}
+    denials=[]
+    denial_line=None
+    with open(path,encoding="utf-8",errors="replace") as stream:
+        for line_number,line in enumerate(stream,1):
+            try:
+                event=json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event,dict):
+                continue
+            message=event.get("message")
+            content=message.get("content") if isinstance(message,dict) else None
+            if not isinstance(content,list):
+                content=[]
+            kind=event.get("type")
+            if kind=="assistant":
+                for block in content:
+                    if isinstance(block,dict) and block.get("type")=="tool_use":
+                        tool_input=block.get("input")
+                        uses.append({"line":line_number,"id":block.get("id"),"name":block.get("name"),
+                                     "input":tool_input if isinstance(tool_input,dict) else {}})
+            elif kind=="user":
+                for block in content:
+                    if isinstance(block,dict) and block.get("type")=="tool_result":
+                        results[block.get("tool_use_id")]={"line":line_number,"is_error":block.get("is_error") is True}
+            elif kind=="result":
+                raw=event.get("permission_denials")
+                denials=[item for item in raw if isinstance(item,dict)] if isinstance(raw,list) else []
+                denial_line=line_number
+    return uses,results,denials,denial_line
+def command_of(use):
+    value=use["input"].get("command")
+    return value if isinstance(value,str) else None
+def path_of(use):
+    value=use["input"].get("file_path")
+    return value if isinstance(value,str) else None
+def result_of(use,results):
+    return results.get(use["id"]) if use["id"] is not None else None
+def denial_evidence(use,denials):
+    for denial in denials:
+        if use["id"] is not None and denial.get("tool_use_id")==use["id"]:
+            return "tool_use_id"
+    for key,value in (("command",command_of(use)),("file_path",path_of(use))):
+        if value:
+            for denial in denials:
+                denied_input=denial.get("tool_input")
+                if isinstance(denied_input,dict) and denied_input.get(key)==value:
+                    return "identical tool_input."+key
+    return None'
+CLAUDE_WRITE_EVIDENCE_CODE="$CLAUDE_STREAM_LIB"'
+def classify(source,target):
+    uses,results,denials,denial_line=read_stream(source)
+    matches=[]
+    for use in uses:
+        command=command_of(use)
+        path=path_of(use)
+        if (command is not None and target in command) or (use["name"] in WRITE_TOOLS and path is not None and target in path):
+            matches.append(use)
+    if not matches:
+        print("UNVERIFIED: no tool_use matched %s; tool_use count observed: %d"%(target,len(uses)))
+        return 2
+    failed=[]
+    pending=[]
+    verified=[]
+    for use in matches:
+        result=result_of(use,results)
+        evidence=denial_evidence(use,denials)
+        if evidence is not None:
+            verified.append("tool_use line %d denied (permission_denials line %d, matched by %s)"%(use["line"],denial_line,evidence))
+        elif result is not None and result["is_error"]:
+            verified.append("tool_use line %d denied (tool_result line %d is_error=true)"%(use["line"],result["line"]))
+        elif result is not None:
+            failed.append("tool_use line %d ran (tool_result line %d is_error=false, not in permission_denials)"%(use["line"],result["line"]))
+        else:
+            pending.append("tool_use line %d has no tool_result and no permission_denials match"%use["line"])
+    if failed:
+        for item in failed:
+            print("FAILED: %s: %s"%(target,item))
+        return 1
+    if pending:
+        for item in pending:
+            print("UNVERIFIED: %s: %s"%(target,item))
+        return 3
+    for item in verified:
+        print("VERIFIED: %s: %s"%(target,item))
+    return 0
+try:
+    code=classify(sys.argv[1],sys.argv[2])
+except OSError as exc:
+    print("UNVERIFIED: could not read Claude stream-json: %s"%exc)
+    code=2
+except Exception as exc:
+    print("UNVERIFIED: could not parse Claude stream-json: %s: %s"%(type(exc).__name__,exc))
+    code=2
+sys.exit(code)
+'
+CLAUDE_GIT_PROBE_CODE="$CLAUDE_STREAM_LIB"'
+def git_probe(source):
+    uses,results,denials,_=read_stream(source)
+    candidates=[use for use in uses if use["name"]=="Bash" and command_of(use) is not None and GIT_LOG.search(command_of(use))]
+    if not candidates:
+        print("FAILED: no Bash tool_use ran git log; tool_use count observed: %d"%len(uses))
+        return 1
+    reasons=[]
+    for use in candidates:
+        result=result_of(use,results)
+        if result is None:
+            reasons.append("tool_use line %d has no tool_result"%use["line"])
+        elif result["is_error"]:
+            reasons.append("tool_use line %d tool_result is_error=true"%use["line"])
+        elif denial_evidence(use,denials) is not None:
+            reasons.append("tool_use line %d is in permission_denials"%use["line"])
+        else:
+            print("PASS: git log tool_use line %d returned tool_result line %d without error"%(use["line"],result["line"]))
+            return 0
+    print("FAILED: no git log tool_use succeeded: %s"%"; ".join(reasons))
+    return 1
+try:
+    code=git_probe(sys.argv[1])
+except Exception as exc:
+    print("FAILED: could not parse Claude stream-json: %s: %s"%(type(exc).__name__,exc))
+    code=1
+sys.exit(code)
+'
+CLAUDE_SESSION_IDS_CODE='import json,sys
+source,expected=sys.argv[1:]
+seen=0
+mismatched=0
+try:
+    with open(source,encoding="utf-8",errors="replace") as stream:
+        for line in stream:
+            try:
+                event=json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event,dict) and "session_id" in event:
+                seen+=1
+                if event.get("session_id")!=expected:
+                    mismatched+=1
+except OSError as exc:
+    print("could not read stream-json: %s"%exc)
+    sys.exit(2)
+print("session_id values observed: %d; not equal to the parent session: %d"%(seen,mismatched))
+sys.exit(0 if seen and not mismatched else 1)
+'
+CLAUDE_INIT_CODE='import json,sys
+source,destination=sys.argv[1:]
+init=None
+try:
+    with open(source,encoding="utf-8",errors="replace") as stream:
+        for line in stream:
+            try:
+                event=json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event,dict) and event.get("type")=="system" and event.get("subtype")=="init":
+                init=event
+                break
+except OSError:
+    init=None
+def show(value):
+    if value is None:
+        return "missing"
+    if isinstance(value,str):
+        return value
+    return json.dumps(value,sort_keys=True)
+def count(value):
+    return str(len(value)) if isinstance(value,list) else show(value)
+if init is None:
+    lines=["init event: missing"]
+else:
+    lines=[
+        "tools: "+show(init.get("tools")),
+        "plugins: "+count(init.get("plugins")),
+        "skills: "+count(init.get("skills")),
+        "agents: "+count(init.get("agents")),
+        "mcp_servers: "+count(init.get("mcp_servers")),
+        "permissionMode: "+show(init.get("permissionMode")),
+        "apiKeySource: "+show(init.get("apiKeySource")),
+        "claude_code_version: "+show(init.get("claude_code_version")),
+    ]
+with open(destination,"w",encoding="utf-8") as output:
+    output.write("\n".join(lines)+"\n")
+sys.exit(0 if init is not None else 1)
+'
+CLAUDE_EVENT_SHAPE_CODE='import collections,json,sys
+source,backend_session,invocation_path,route,destination=sys.argv[1:]
+problems=[]
+events=[]
+try:
+    with open(source,encoding="utf-8",errors="replace") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                problems.append("malformed stream-json line")
+except OSError:
+    problems.append("stream-json output is unreadable")
+argv=None
+try:
+    with open(invocation_path,encoding="utf-8") as stream:
+        argv=json.load(stream).get("argv")
+except (OSError,ValueError,AttributeError):
+    argv=None
+assigned=None
+if isinstance(argv,list) and "--session-id" in argv and argv.index("--session-id")+1<len(argv):
+    assigned=argv[argv.index("--session-id")+1]
+else:
+    problems.append("invocation argv has no --session-id value")
+if not backend_session:
+    problems.append("job has no recorded backend session id")
+identity_ok=bool(backend_session) and assigned==backend_session
+if not identity_ok and assigned is not None and backend_session:
+    problems.append("assigned session id differs from the recorded backend session id")
+dict_events=[event for event in events if isinstance(event,dict)]
+if len(dict_events)!=len(events):
+    problems.append("stream-json contains a non-object event")
+counts=collections.Counter(str(event.get("type","<missing>")) for event in dict_events)
+inits=[event for event in dict_events if event.get("type")=="system" and event.get("subtype")=="init"]
+results=[event for event in dict_events if event.get("type")=="result"]
+if not inits:
+    problems.append("no init event")
+if not results:
+    problems.append("no result event")
+elif results[-1].get("subtype")!="success":
+    problems.append("final result subtype is not success")
+with_id=0
+without_id=0
+mismatched=0
+for event in dict_events:
+    if "session_id" not in event:
+        without_id+=1
+        continue
+    with_id+=1
+    if event.get("session_id")!=backend_session or event.get("session_id")!=assigned:
+        mismatched+=1
+if mismatched:
+    problems.append("%d events carry a session_id that differs from the job identity"%mismatched)
+if any(not isinstance(event.get("session_id"),str) for event in inits+results):
+    problems.append("init or result event has no session_id")
+for event in inits:
+    if route=="sub" and event.get("apiKeySource")!="none":
+        problems.append("route sub init event did not report apiKeySource none")
+providers=[]
+for event in results:
+    usage_map=event.get("modelUsage")
+    if isinstance(usage_map,dict):
+        for usage in usage_map.values():
+            providers.append(usage.get("provider") if isinstance(usage,dict) else None)
+if any(provider!="firstParty" for provider in providers):
+    problems.append("a modelUsage provider is not firstParty")
+sources=sorted(set(str(event.get("apiKeySource")) for event in inits))
+final_subtype=str(results[-1].get("subtype")) if results else "missing"
+lines=["event_type %s count %d"%(kind,counts[kind]) for kind in sorted(counts)]
+lines.append("init events: %d"%len(inits))
+lines.append("result events: %d; final subtype: %s"%(len(results),final_subtype))
+lines.append("events with session_id: %d; without session_id: %d; mismatched: %d"%(with_id,without_id,mismatched))
+lines.append("session identity matches recorded backend session and argv: %s"%("yes" if identity_ok and not mismatched else "no"))
+lines.append("init apiKeySource: %s"%(", ".join(sources) if sources else "missing"))
+lines.append("modelUsage providers: %s"%(", ".join(sorted(set(str(p) for p in providers))) if providers else "none reported"))
+with open(destination,"w",encoding="utf-8") as output:
+    output.write("\n".join(lines)+"\n")
+for problem in problems:
+    print("problem: "+problem)
+sys.exit(1 if problems else 0)
+'
+CLAUDE_HOST_MARKER_NAMES=(CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_MESSAGING_SOCKET CODEX_THREAD_ID)
+
+# Prints claude, codex, or none from the launcher environment; Claude markers take precedence.
+nested_launch_host() {
+    local marker
+    for marker in CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_MESSAGING_SOCKET; do
+        if [ -n "${!marker:-}" ]; then
+            printf 'claude'
+            return 0
+        fi
+    done
+    if [ -n "${CODEX_THREAD_ID:-}" ]; then
+        printf 'codex'
+    else
+        printf 'none'
+    fi
+}
+
+# Records the names, never the values, of host markers set in the launcher environment.
+record_host_markers() {
+    local marker
+    : >"$RUN_ROOT/host-markers.txt" || exit 2
+    for marker in "${CLAUDE_HOST_MARKER_NAMES[@]}"; do
+        if [ -n "${!marker:-}" ]; then
+            printf '%s\n' "$marker" >>"$RUN_ROOT/host-markers.txt"
+        fi
+    done
+}
+
+show_claude_dry_run() {
+    local target
+    DRY_ROOT="$TMP_PARENT/agent-relay-live-check-dry-run"
+    DRY_WORKSPACE="$DRY_ROOT/workspace"
+    DRY_STATE="$DRY_ROOT/state"
+    printf 'Dry-run for backend: claude\n'
+    printf 'Example isolated root: %s\n' "$DRY_ROOT"
+    printf 'Commands below are printed only; no files or backend processes are created.\n'
+    printf 'Route: %s\n' "$ROUTE"
+    printf 'Model: %s\n' "$MODEL"
+    printf 'Nested launch from host: %s\n' "$(nested_launch_host)"
+    print_command git -C "$DRY_WORKSPACE" init -q
+    printf '  fixture: README.txt and sub/NOTE.txt, committed once with message init\n'
+    print_command git -C "$DRY_WORKSPACE" add README.txt sub
+    print_command git -C "$DRY_WORKSPACE" -c user.name=live -c user.email=live@invalid -c core.hooksPath=/dev/null commit -q -m init
+    show_dry_launch "live-readonly" no "live-check" "live-check-dry-run" "$CLAUDE_READONLY_TASK"
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" wait "<readonly-job-id>" --timeout 180 --interval 0.25
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" result "<readonly-job-id>"
+    print_command "$PYTHON" -c "$CLAUDE_INIT_CODE" "$DRY_STATE/jobs/<readonly-job-id>/stdout.log" "$DRY_ROOT/live-readonly.init.txt"
+    for target in "${CLAUDE_PROBE_FILES[@]}"; do
+        print_command "$PYTHON" -c "$CLAUDE_WRITE_EVIDENCE_CODE" "$DRY_STATE/jobs/<readonly-job-id>/stdout.log" "$target"
+    done
+    show_dry_launch "live-write" yes "live-check" "live-check-dry-run" \
+        "Create authorized-edit.txt with exactly AUTHORIZED_WRITE_OK, then reply exactly WRITE_COMPLETE."
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" wait "<authorized-edit-job-id>" --timeout 180 --interval 0.25
+    print_command env "RELAY_JOB_HOST=live-check" "RELAY_JOB_CONVERSATION_ID=live-check-dry-run" \
+        "CLAUDE_CODE_SESSION_ID=" "CODEX_THREAD_ID=" "CODEX_SESSION_ID=" \
+        "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" resume "<authorized-edit-job-id>" --stdin
+    printf '  resume stdin prompt: %s\n' "Run exactly 'touch resume-readonly.txt' with the shell in the job workspace, even if you expect it to be denied. Report the exact command, exit code, stdout, and stderr."
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" wait "<resume-job-id>" --timeout 180 --interval 0.25
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" result "<resume-job-id>"
+    print_command "$PYTHON" -c "$CLAUDE_SESSION_IDS_CODE" "$DRY_STATE/jobs/<resume-job-id>/stdout.log" "<authorized-edit-session-id>"
+    print_command "$PYTHON" -c "$CLAUDE_WRITE_EVIDENCE_CODE" "$DRY_STATE/jobs/<resume-job-id>/stdout.log" resume-readonly.txt
+    print_command "$PYTHON" -c "$SQLITE_LOCK_CODE" "$DRY_STATE" "$DRY_ROOT/wal-ready" "$DRY_ROOT/wal-release" "<authorized-edit-job-id>"
+    printf '  The SQLite read-lock holder runs in the background while status reads a completed job.\n'
+    show_dry_launch "live-cancel" yes "live-check" "live-check-dry-run" "$CLAUDE_ESSAY_TASK"
+    printf '  cancellation readiness: poll status until the job is running with a live recorded process group.\n'
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" status --json "<cancel-job-id>"
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" cancel "<cancel-job-id>" --timeout 20
+    print_command ps -A -o pid=,pgid=,stat=
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" result "<authorized-edit-job-id>"
+    print_command "$PYTHON" -c "$CLAUDE_EVENT_SHAPE_CODE" "$DRY_STATE/jobs/<readonly-job-id>/stdout.log" \
+        "<readonly-session-id>" "$DRY_STATE/jobs/<readonly-job-id>/invocation.json" sub "$DRY_ROOT/claude-event-shapes.log"
+    printf 'Codex queue delivery: SKIP (Codex backend only).\n'
+    show_dry_launch "live-git" no "live-check" "live-check-dry-run" "$CLAUDE_GIT_TASK" "$DRY_WORKSPACE/sub"
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" wait "<git-job-id>" --timeout 180 --interval 0.25
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" status --json "<git-job-id>"
+    print_command "$PYTHON" -c "$CLAUDE_GIT_PROBE_CODE" "$DRY_STATE/jobs/<git-job-id>/stdout.log"
+    print_command env "RELAY_JOB_HOST=live-check" "RELAY_JOB_CONVERSATION_ID=live-check-dry-run" \
+        "CLAUDE_CODE_SESSION_ID=" "CODEX_THREAD_ID=" "CODEX_SESSION_ID=" \
+        "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" resume "<git-job-id>" --stdin
+    printf '  resume stdin prompt: %s\n' "$CLAUDE_RESUME_GIT_TASK"
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" wait "<git-resume-job-id>" --timeout 180 --interval 0.25
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" status --json "<git-resume-job-id>"
+    print_command "$PYTHON" -c "$CLAUDE_SESSION_IDS_CODE" "$DRY_STATE/jobs/<git-resume-job-id>/stdout.log" "<git-session-id>"
+    print_command "$PYTHON" "$RELAY_JOB" --state-dir "$DRY_STATE" result "<git-resume-job-id>"
+    for index in 0 1 2 3 4 5 6 8; do
+        STEP_RESULTS[index]="SKIP (dry-run)"
+    done
+    STEP_RESULTS[7]="SKIP (Codex backend only)"
+}
+
 show_dry_launch() {
-    local label write host conversation prompt
+    local label write host conversation prompt dir
     local -a arguments
     label="$1"
     write="$2"
     host="$3"
     conversation="$4"
     prompt="$5"
+    dir="${6:-$DRY_WORKSPACE}"
     arguments=(--state-dir "$DRY_STATE" run --backend "$BACKEND")
     if [ "$BACKEND" = "opencode" ]; then
         arguments+=(--route sub)
     fi
+    if [ "$BACKEND" = "claude" ]; then
+        arguments+=(--route "$ROUTE" --model "$MODEL")
+    fi
     if [ "$write" = "yes" ]; then
         arguments+=(--write)
     fi
-    arguments+=(--dir "$DRY_WORKSPACE" --label "$label" --stdin)
+    arguments+=(--dir "$dir" --label "$label" --stdin)
     printf '  stdin prompt: %s\n' "$prompt"
     print_command env "RELAY_JOB_HOST=$host" "RELAY_JOB_CONVERSATION_ID=$conversation" \
         "CLAUDE_CODE_SESSION_ID=" "CODEX_THREAD_ID=" "CODEX_SESSION_ID=" \
         "$PYTHON" "$RELAY_JOB" "${arguments[@]}"
 }
+
+if [ "$DRY_RUN" -eq 1 ] && [ "$BACKEND" = "claude" ]; then
+    show_claude_dry_run
+    show_summary
+    exit 0
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
     DRY_ROOT="$TMP_PARENT/agent-relay-live-check-dry-run"
@@ -456,11 +885,30 @@ git -C "$WORKSPACE" init -q || {
     echo "error: could not initialize isolated git repository" >&2
     exit 2
 }
+if [ "$BACKEND" = "claude" ]; then
+    printf 'Claude fixture\n' >"$WORKSPACE/README.txt" || exit 2
+    mkdir "$WORKSPACE/sub" || exit 2
+    printf 'Claude subdirectory fixture\n' >"$WORKSPACE/sub/NOTE.txt" || exit 2
+    git -C "$WORKSPACE" add README.txt sub || {
+        echo "error: could not stage the Claude workspace fixture" >&2
+        exit 2
+    }
+    git -C "$WORKSPACE" -c user.name=live -c user.email=live@invalid -c core.hooksPath=/dev/null commit -q -m init || {
+        echo "error: could not commit the Claude workspace fixture" >&2
+        exit 2
+    }
+fi
 printf 'Live check root: %s\n' "$RUN_ROOT"
 printf 'Backend: %s\n' "$BACKEND"
+if [ "$BACKEND" = "claude" ]; then
+    printf 'Route: %s\n' "$ROUTE"
+    printf 'Model: %s\n' "$MODEL"
+    record_host_markers
+    printf 'Nested launch from host: %s\n' "$(nested_launch_host)"
+fi
 
 launch_job() {
-    local label write task host conversation stdout_path stderr_path job_id result
+    local label write task host conversation dir stdout_path stderr_path job_id result
     local -a arguments
     LAUNCHED_JOB_ID=""
     label="$1"
@@ -468,16 +916,20 @@ launch_job() {
     task="$3"
     host="$4"
     conversation="$5"
+    dir="${6:-$WORKSPACE}"
     stdout_path="$RUN_ROOT/$label.launch.stdout"
     stderr_path="$RUN_ROOT/$label.launch.stderr"
     arguments=(--state-dir "$STATE_DIR" run --backend "$BACKEND")
     if [ "$BACKEND" = "opencode" ]; then
         arguments+=(--route sub)
     fi
+    if [ "$BACKEND" = "claude" ]; then
+        arguments+=(--route "$ROUTE" --model "$MODEL")
+    fi
     if [ "$write" = "yes" ]; then
         arguments+=(--write)
     fi
-    arguments+=(--dir "$WORKSPACE" --label "$label" --stdin)
+    arguments+=(--dir "$dir" --label "$label" --stdin)
     if printf '%s\n' "$task" | env \
         "RELAY_JOB_HOST=$host" \
         "RELAY_JOB_CONVERSATION_ID=$conversation" \
@@ -656,8 +1108,293 @@ write_event_log() {
     "$PYTHON" -c "$EVENT_SHAPE_CODE" "$stdout_path" "$log_path"
 }
 
+claude_write_attempt_evidence() {
+    local stdout_path target evidence_path result
+    stdout_path="$1"
+    target="$2"
+    evidence_path="$3"
+    "$PYTHON" -c "$CLAUDE_WRITE_EVIDENCE_CODE" "$stdout_path" "$target" \
+        >"$evidence_path" 2>&1
+    result=$?
+    cat "$evidence_path"
+    case "$result" in
+        0|1|2|3) return "$result" ;;
+        *) return 5 ;;
+    esac
+}
+
+# Checks each target. Returns 0 when all are verified, 1 when one ran (CLAUDE_FAILED_TARGET set),
+# 2 when one is unverified (CLAUDE_SKIP_REASON set), and 5 when the parser output is unexpected.
+claude_check_targets() {
+    local stdout_path evidence_base target evidence_path result
+    stdout_path="$1"
+    evidence_base="$2"
+    shift 2
+    CLAUDE_SKIP_REASON=""
+    CLAUDE_FAILED_TARGET=""
+    for target in "$@"; do
+        evidence_path="$evidence_base.$(printf '%s' "$target" | tr -c 'A-Za-z0-9' '_').txt"
+        result=0
+        claude_write_attempt_evidence "$stdout_path" "$target" "$evidence_path" || result=$?
+        case "$result" in
+            0) ;;
+            1)
+                CLAUDE_FAILED_TARGET="$target"
+                return 1
+                ;;
+            2)
+                [ -n "$CLAUDE_SKIP_REASON" ] || CLAUDE_SKIP_REASON="no tool_use matched $target in stream-json"
+                ;;
+            3)
+                [ -n "$CLAUDE_SKIP_REASON" ] || CLAUDE_SKIP_REASON="$target has a tool_use with no result or denial"
+                ;;
+            *)
+                return 5
+                ;;
+        esac
+    done
+    [ -z "$CLAUDE_SKIP_REASON" ] || return 2
+    return 0
+}
+
+claude_group_snapshot() {
+    ps -A -o pid=,pgid=,stat= 2>/dev/null | awk -v group="$1" '$2 == group { print }'
+}
+
+claude_group_is_live() {
+    claude_group_snapshot "$1" | awk '$3 !~ /^Z/ { live = 1 } END { exit live ? 0 : 1 }'
+}
+
+resume_claude_job() {
+    local parent_id task label stdout_path stderr_path
+    parent_id="$1"
+    task="$2"
+    label="$3"
+    LAUNCHED_JOB_ID=""
+    stdout_path="$RUN_ROOT/$label.launch.stdout"
+    stderr_path="$RUN_ROOT/$label.launch.stderr"
+    if printf '%s\n' "$task" | env \
+        "RELAY_JOB_HOST=live-check" \
+        "RELAY_JOB_CONVERSATION_ID=live-check-$$" \
+        "RELAY_JOB_STATE_DIR=$STATE_DIR" \
+        "CLAUDE_CODE_SESSION_ID=" "CLAUDE_PLUGIN_DATA=" "PLUGIN_DATA=" \
+        "CODEX_THREAD_ID=" "CODEX_SESSION_ID=" \
+        "$PYTHON" "$RELAY_JOB" --state-dir "$STATE_DIR" resume "$parent_id" --stdin \
+        >"$stdout_path" 2>"$stderr_path"; then
+        :
+    else
+        cat "$stderr_path" >&2
+        return 1
+    fi
+    cat "$stderr_path" >&2
+    LAUNCHED_JOB_ID="$(sed -n '1p' "$stdout_path")"
+    [ -n "$LAUNCHED_JOB_ID" ]
+}
+
+check_claude_readonly_probes() {
+    local probe rc
+    READONLY_STDOUT="$(json_value stdout_path "$READONLY_JSON")"
+    [ -n "$READONLY_STDOUT" ] || abort_step 0 "read-only job status has no stdout_path"
+    "$PYTHON" -c "$CLAUDE_INIT_CODE" "$READONLY_STDOUT" "$RUN_ROOT/live-readonly.init.txt" || true
+    cat "$RUN_ROOT/live-readonly.init.txt"
+    for probe in "${CLAUDE_PROBE_FILES[@]}"; do
+        if [ -e "$WORKSPACE/$probe" ]; then
+            rm -f "$WORKSPACE/$probe"
+            abort_step 0 "read-only job created $probe"
+        fi
+    done
+    rc=0
+    claude_check_targets "$READONLY_STDOUT" "$RUN_ROOT/live-readonly.evidence" "${CLAUDE_PROBE_FILES[@]}" || rc=$?
+    case "$rc" in
+        0)
+            set_step 0 "PASS"
+            printf 'PASS: no probe file exists, and Claude stream-json records a denied attempt for each probe.\n'
+            ;;
+        1)
+            abort_step 0 "Claude stream-json shows $CLAUDE_FAILED_TARGET ran"
+            ;;
+        2)
+            set_step 0 "SKIP (enforcement unverified: $CLAUDE_SKIP_REASON)"
+            printf 'SKIP: no probe file exists, but Claude stream-json does not prove a denied attempt: %s.\n' "$CLAUDE_SKIP_REASON"
+            ;;
+        *)
+            abort_step 0 "could not inspect the Claude command evidence"
+            ;;
+    esac
+}
+
+check_claude_continuation() {
+    local resume_stdout rc
+    if [ -e "$WORKSPACE/resume-readonly.txt" ]; then
+        rm -f "$WORKSPACE/resume-readonly.txt"
+        abort_step 2 "read-only continuation created resume-readonly.txt"
+    fi
+    resume_stdout="$(json_value stdout_path "$RESUME_JSON")"
+    [ -n "$resume_stdout" ] || abort_step 2 "continuation status has no stdout_path"
+    rc=0
+    "$PYTHON" -c "$CLAUDE_SESSION_IDS_CODE" "$resume_stdout" "$PARENT_SESSION" || rc=$?
+    [ "$rc" -eq 0 ] || abort_step 2 "continuation stream has a session_id other than the parent session, or none"
+    rc=0
+    claude_check_targets "$resume_stdout" "$RUN_ROOT/live-resume.evidence" resume-readonly.txt || rc=$?
+    case "$rc" in
+        0)
+            set_step 2 "PASS"
+            printf 'PASS: continuation kept session %s, reset permission to read-only, and Claude stream-json records a denied write.\n' "$PARENT_SESSION"
+            ;;
+        1)
+            abort_step 2 "Claude stream-json shows touch resume-readonly.txt ran"
+            ;;
+        2)
+            set_step 2 "SKIP (enforcement unverified: $CLAUDE_SKIP_REASON)"
+            printf 'SKIP: continuation kept session %s and reset permission to read-only; resume-readonly.txt is absent, but %s.\n' "$PARENT_SESSION" "$CLAUDE_SKIP_REASON"
+            ;;
+        *)
+            abort_step 2 "could not inspect the Claude continuation command evidence"
+            ;;
+    esac
+}
+
+check_claude_event_shape() {
+    local readonly_stdout readonly_session readonly_dir event_log rc
+    readonly_stdout="$(json_value stdout_path "$READONLY_JSON")"
+    readonly_session="$(json_value backend_session_id "$READONLY_JSON")"
+    readonly_dir="$(json_value artifact_dir "$READONLY_JSON")"
+    event_log="$RUN_ROOT/claude-event-shapes.log"
+    if [ -z "$readonly_stdout" ] || [ -z "$readonly_dir" ]; then
+        abort_step 6 "read-only job status lacks stdout_path or artifact_dir"
+    fi
+    rc=0
+    "$PYTHON" -c "$CLAUDE_EVENT_SHAPE_CODE" "$readonly_stdout" "$readonly_session" \
+        "$readonly_dir/invocation.json" "$ROUTE" "$event_log" || rc=$?
+    printf 'Claude event evidence: %s\n' "$event_log"
+    cat "$event_log"
+    if [ "$rc" -ne 0 ]; then
+        abort_step 6 "Claude event shape or identity check failed; see $event_log"
+    fi
+    set_step 6 "PASS"
+    printf 'PASS: init event, session identity, final success result, and firstParty providers agree.\n'
+}
+
+run_claude_cancel_check() {
+    local job_json state pgid group_live cancel_rc deadline
+    launch_job live-cancel yes "$CLAUDE_ESSAY_TASK" live-check "live-check-$$" || abort_step 4 "cancellation job did not launch"
+    CANCEL_ID="$LAUNCHED_JOB_ID"
+    PENDING_JOB_ID="$CANCEL_ID"
+    state=""
+    pgid=""
+    deadline=$((SECONDS + 30))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        job_json="$(status_json "$CANCEL_ID" 2>/dev/null)" || job_json=""
+        if [ -n "$job_json" ]; then
+            state="$(json_value state "$job_json")"
+            pgid="$(json_value group_pgid "$job_json")"
+            if [ "$state" = "running" ] && [ -n "$pgid" ] && claude_group_is_live "$pgid"; then
+                break
+            fi
+            case "$state" in
+                done|failed|cancelled|crashed|ownership_unresolved) break ;;
+            esac
+        fi
+        sleep 0.25
+    done
+    if [ "$state" = "done" ]; then
+        PENDING_JOB_ID=""
+        set_step 4 "SKIP (job completed before cancellation)"
+        printf 'SKIP: the write job reached done before it could be cancelled.\n'
+        return 0
+    fi
+    if [ "$state" != "running" ] || [ -z "$pgid" ] || ! claude_group_is_live "$pgid"; then
+        abort_step 4 "write job had no live process group before cancellation (state ${state:-unknown})"
+    fi
+    claude_group_snapshot "$pgid" >"$RUN_ROOT/claude-cancel.group.before"
+    cancel_rc=0
+    "$PYTHON" "$RELAY_JOB" --state-dir "$STATE_DIR" cancel "$CANCEL_ID" --timeout 20 \
+        >"$RUN_ROOT/claude-cancel.stdout" 2>"$RUN_ROOT/claude-cancel.stderr" || cancel_rc=$?
+    deadline=$((SECONDS + 20))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        job_json="$(status_json "$CANCEL_ID" 2>/dev/null)" || job_json=""
+        if [ -n "$job_json" ]; then
+            state="$(json_value state "$job_json")"
+        fi
+        if ! claude_group_is_live "$pgid"; then
+            case "$state" in
+                cancelled|done|failed|crashed|ownership_unresolved) break ;;
+            esac
+        fi
+        sleep 0.5
+    done
+    claude_group_snapshot "$pgid" >"$RUN_ROOT/claude-cancel.group.after"
+    group_live=0
+    if claude_group_is_live "$pgid"; then
+        group_live=1
+    fi
+    if [ "$group_live" -ne 0 ]; then
+        abort_step 4 "processes remained in PGID $pgid 20 seconds after cancellation"
+    fi
+    PENDING_JOB_ID=""
+    if [ "$state" = "done" ]; then
+        set_step 4 "SKIP (job completed before cancellation)"
+        printf 'SKIP: the write job reached done before cancellation took effect.\n'
+        return 0
+    fi
+    if [ "$state" != "cancelled" ]; then
+        abort_step 4 "write job ended as ${state:-unknown} after cancel (cancel exit $cancel_rc)"
+    fi
+    set_step 4 "PASS"
+    printf 'PASS: the write job reached cancelled and no process remained in recorded PGID %s.\n' "$pgid"
+}
+
+run_claude_git_step() {
+    local git_json git_stdout git_session git_cwd resume_json resume_stdout rc
+    launch_job live-git no "$CLAUDE_GIT_TASK" live-check "live-check-$$" "$WORKSPACE/sub" \
+        || abort_step 8 "subdirectory job did not launch"
+    GIT_ID="$LAUNCHED_JOB_ID"
+    PENDING_JOB_ID="$GIT_ID"
+    wait_job "$GIT_ID" || abort_step 8 "subdirectory job did not complete successfully"
+    git_json="$(status_json "$GIT_ID")" || abort_step 8 "could not read subdirectory job status"
+    git_cwd="$(json_value cwd "$git_json")"
+    if [ "$git_cwd" != "$WORKSPACE_REAL/sub" ]; then
+        abort_step 8 "subdirectory job recorded cwd $git_cwd instead of $WORKSPACE_REAL/sub"
+    fi
+    git_stdout="$(json_value stdout_path "$git_json")"
+    git_session="$(json_value backend_session_id "$git_json")"
+    if [ -z "$git_stdout" ] || [ -z "$git_session" ]; then
+        abort_step 8 "subdirectory job lacks a stdout_path or backend session"
+    fi
+    rc=0
+    "$PYTHON" -c "$CLAUDE_GIT_PROBE_CODE" "$git_stdout" || rc=$?
+    [ "$rc" -eq 0 ] || abort_step 8 "subdirectory job has no successful git log tool_use"
+    resume_claude_job "$GIT_ID" "$CLAUDE_RESUME_GIT_TASK" live-git-resume \
+        || abort_step 8 "continuation of the subdirectory job did not launch"
+    RESUME_GIT_ID="$LAUNCHED_JOB_ID"
+    PENDING_JOB_ID="$RESUME_GIT_ID"
+    wait_job "$RESUME_GIT_ID" || abort_step 8 "subdirectory continuation did not complete successfully"
+    resume_json="$(status_json "$RESUME_GIT_ID")" || abort_step 8 "could not read subdirectory continuation status"
+    if [ "$(json_value cwd "$resume_json")" != "$git_cwd" ] \
+            || [ "$(json_value parent_job_id "$resume_json")" != "$GIT_ID" ] \
+            || [ "$(json_value backend_session_id "$resume_json")" != "$git_session" ] \
+            || [ "$(json_value write "$resume_json")" != "False" ]; then
+        abort_step 8 "subdirectory continuation did not keep the parent cwd, session, and read-only mode"
+    fi
+    resume_stdout="$(json_value stdout_path "$resume_json")"
+    rc=0
+    "$PYTHON" -c "$CLAUDE_SESSION_IDS_CODE" "$resume_stdout" "$git_session" || rc=$?
+    [ "$rc" -eq 0 ] || abort_step 8 "subdirectory continuation has a session_id other than the parent session, or none"
+    RESUME_GIT_RESULT="$RUN_ROOT/live-git-resume.result.txt"
+    "$PYTHON" "$RELAY_JOB" --state-dir "$STATE_DIR" result "$RESUME_GIT_ID" \
+        >"$RESUME_GIT_RESULT" 2>"$RUN_ROOT/live-git-resume.result.stderr" \
+        || abort_step 8 "result command failed for the subdirectory continuation"
+    grep -Fq "RESUME_OK" "$RESUME_GIT_RESULT" || abort_step 8 "subdirectory continuation did not reply RESUME_OK"
+    PENDING_JOB_ID=""
+    set_step 8 "PASS"
+    printf 'PASS: git log ran in %s, and the read-only continuation replied RESUME_OK in the same session and cwd.\n' "$git_cwd"
+}
+
 step_start 0
 READONLY_TASK="Run exactly 'touch readonly-probe.txt' with the shell in the job workspace, even if you expect it to be denied. Report the exact command, exit code, stdout, and stderr."
+if [ "$BACKEND" = "claude" ]; then
+    READONLY_TASK="$CLAUDE_READONLY_TASK"
+fi
 launch_job live-readonly no "$READONLY_TASK" live-check "live-check-$$" || abort_step 0 "read-only job did not launch"
 READONLY_ID="$LAUNCHED_JOB_ID"
 PENDING_JOB_ID="$READONLY_ID"
@@ -705,6 +1442,8 @@ if [ "$BACKEND" = "codex" ]; then
             abort_step 0 "could not inspect the Codex command-execution evidence"
             ;;
     esac
+elif [ "$BACKEND" = "claude" ]; then
+    check_claude_readonly_probes
 else
     if [ -e "$WORKSPACE/readonly-probe.txt" ]; then
         rm -f "$WORKSPACE/readonly-probe.txt" || abort_step 0 "could not remove OpenCode readonly probe"
@@ -806,6 +1545,8 @@ if [ "$BACKEND" = "codex" ]; then
             abort_step 2 "could not inspect the Codex continuation command-execution evidence"
             ;;
     esac
+elif [ "$BACKEND" = "claude" ]; then
+    check_claude_continuation
 else
     if [ -e "$WORKSPACE/resume-readonly.txt" ]; then
         rm -f "$WORKSPACE/resume-readonly.txt" || abort_step 2 "could not remove OpenCode resume probe"
@@ -854,179 +1595,183 @@ set_step 3 "PASS"
 printf 'PASS: WAL/SHM sidecars appeared and status read a completed job during a SQLite read lock.\n'
 
 step_start 4
-CANCEL_TOKEN="$$${RANDOM}$(date +%s)"
-CANCEL_TASK="Run exactly this shell command in the job workspace, then wait for cancellation: exec sleep 300.${CANCEL_TOKEN}"
-CANCEL_ID=""
-launch_job live-cancel yes "$CANCEL_TASK" live-check "live-check-$$" || abort_step 4 "cancellation job did not launch"
-CANCEL_ID="$LAUNCHED_JOB_ID"
-PENDING_JOB_ID="$CANCEL_ID"
-CANCEL_CHILD_PID=""
-CANCEL_CHILD_PGID=""
-CANCEL_CHILD_SID=""
-CANCEL_CHILD_FOUND=0
-CANCEL_RUNNING_JSON=""
-CANCEL_STATE=""
-deadline=$((SECONDS + 120))
-while [ "$SECONDS" -lt "$deadline" ]; do
-    find_cancel_child
-    FIND_CANCEL_RC=$?
-    case "$FIND_CANCEL_RC" in
-        0)
-            CANCEL_CHILD_FOUND=1
-            printf '%s\n' "$CANCEL_PS_LISTING" >"$RUN_ROOT/live-cancel.ps.before"
-            break
-            ;;
-        1) ;;
-        *) abort_step 4 "host ps could not identify one unique cancellation child for token $CANCEL_TOKEN" ;;
-    esac
-    CANCEL_RUNNING_JSON="$(status_json "$CANCEL_ID" 2>"$RUN_ROOT/live-cancel.status.stderr")" || \
-        CANCEL_RUNNING_JSON=""
-    if [ -n "$CANCEL_RUNNING_JSON" ]; then
-        CANCEL_STATE="$(json_value state "$CANCEL_RUNNING_JSON")"
-        case "$CANCEL_STATE" in
-            done|failed|cancelled|crashed|ownership_unresolved)
+if [ "$BACKEND" = "claude" ]; then
+    run_claude_cancel_check
+else
+    CANCEL_TOKEN="$$${RANDOM}$(date +%s)"
+    CANCEL_TASK="Run exactly this shell command in the job workspace, then wait for cancellation: exec sleep 300.${CANCEL_TOKEN}"
+    CANCEL_ID=""
+    launch_job live-cancel yes "$CANCEL_TASK" live-check "live-check-$$" || abort_step 4 "cancellation job did not launch"
+    CANCEL_ID="$LAUNCHED_JOB_ID"
+    PENDING_JOB_ID="$CANCEL_ID"
+    CANCEL_CHILD_PID=""
+    CANCEL_CHILD_PGID=""
+    CANCEL_CHILD_SID=""
+    CANCEL_CHILD_FOUND=0
+    CANCEL_RUNNING_JSON=""
+    CANCEL_STATE=""
+    deadline=$((SECONDS + 120))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        find_cancel_child
+        FIND_CANCEL_RC=$?
+        case "$FIND_CANCEL_RC" in
+            0)
+                CANCEL_CHILD_FOUND=1
+                printf '%s\n' "$CANCEL_PS_LISTING" >"$RUN_ROOT/live-cancel.ps.before"
                 break
                 ;;
+            1) ;;
+            *) abort_step 4 "host ps could not identify one unique cancellation child for token $CANCEL_TOKEN" ;;
         esac
-    fi
-    sleep 0.25
-done
-if [ "$CANCEL_CHILD_FOUND" -ne 1 ]; then
-    CANCEL_RC=0
-    "$PYTHON" "$RELAY_JOB" --state-dir "$STATE_DIR" cancel "$CANCEL_ID" --timeout 20 \
-        >"$RUN_ROOT/live-cancel.unstarted-cancel.stdout" 2>"$RUN_ROOT/live-cancel.unstarted-cancel.stderr" \
-        || CANCEL_RC=$?
-    CANCEL_JSON="$(status_json "$CANCEL_ID")" || abort_step 4 "could not read status after stopping the unstarted fixture"
-    CANCEL_STATE="$(json_value state "$CANCEL_JSON")"
-    case "$CANCEL_STATE" in
-        cancelled)
-            if [ -z "$(json_value cancel_confirmed_at "$CANCEL_JSON")" ] \
-                    || [ "$(printf '%s\n' "$CANCEL_JSON" | "$PYTHON" -c \
-                        'import json,sys; attempts=json.load(sys.stdin).get("attempts") or []; print(str(bool(attempts and attempts[-1].get("cleanup_confirmed"))))')" != "True" ]; then
-                abort_step 4 "relay did not confirm cleanup of the unstarted cancellation fixture"
-            fi
-            ;;
-        done|failed|crashed)
-            ;;
-        *)
-            abort_step 4 "cancellation fixture never started and relay could not stop its job (cancel exit $CANCEL_RC, state $CANCEL_STATE)"
-            ;;
-    esac
-    PENDING_JOB_ID=""
-    set_step 4 "SKIP (fixture never started)"
-    printf 'SKIP: cancellation child token was never found in host ps before the job ended or the 120-second deadline.\n'
-else
-    CANCEL_PRECHECK_FAILURE=""
-    CANCEL_PGID=""
-    verify_deadline=$((SECONDS + 10))
-    while [ "$SECONDS" -lt "$verify_deadline" ]; do
-        CANCEL_RUNNING_JSON="$(status_json "$CANCEL_ID")" || CANCEL_RUNNING_JSON=""
+        CANCEL_RUNNING_JSON="$(status_json "$CANCEL_ID" 2>"$RUN_ROOT/live-cancel.status.stderr")" || \
+            CANCEL_RUNNING_JSON=""
         if [ -n "$CANCEL_RUNNING_JSON" ]; then
             CANCEL_STATE="$(json_value state "$CANCEL_RUNNING_JSON")"
-            CANCEL_PGID="$(json_value group_pgid "$CANCEL_RUNNING_JSON")"
-            if [ -n "$CANCEL_PGID" ] && [ "$CANCEL_STATE" = "running" ]; then
-                break
-            fi
             case "$CANCEL_STATE" in
                 done|failed|cancelled|crashed|ownership_unresolved)
                     break
                     ;;
             esac
         fi
-        sleep 0.1
-    done
-    if [ -z "$CANCEL_PGID" ] || [ "$CANCEL_STATE" != "running" ]; then
-        CANCEL_PRECHECK_FAILURE="the host-visible child had no live recorded process group before cancellation"
-    fi
-    if [ -n "$CANCEL_PGID" ] && [ "$CANCEL_STATE" = "running" ] \
-            && [ "$CANCEL_CHILD_PGID" = "$CANCEL_PGID" ] \
-            && [ "$CANCEL_CHILD_SID" = "$CANCEL_PGID" ]; then
-        CANCEL_CHILD_IN_GROUP=1
-    else
-        CANCEL_CHILD_IN_GROUP=0
-    fi
-    CANCEL_RC=0
-    "$PYTHON" "$RELAY_JOB" --state-dir "$STATE_DIR" cancel "$CANCEL_ID" --timeout 20 \
-        || CANCEL_RC=$?
-    CANCEL_STATUS_ERROR=""
-    CANCEL_JSON="$(status_json "$CANCEL_ID")" || CANCEL_STATUS_ERROR="could not read cancelled job status"
-    CANCEL_CHILD_AFTER_LIVE=0
-    CANCEL_CHILD_AFTER_PID=""
-    deadline=$((SECONDS + 15))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        find_cancel_child
-        FIND_CANCEL_RC=$?
-        case "$FIND_CANCEL_RC" in
-            1) break ;;
-            0)
-                printf '%s\n' "$CANCEL_PS_LISTING" >"$RUN_ROOT/live-cancel.ps.after"
-                if process_is_live "$CANCEL_CHILD_PID"; then
-                    CANCEL_CHILD_AFTER_LIVE=1
-                    CANCEL_CHILD_AFTER_PID="$CANCEL_CHILD_PID"
-                    if [ "$CANCEL_CHILD_IN_GROUP" -eq 0 ]; then
-                        break
-                    fi
-                else
-                    CANCEL_CHILD_AFTER_LIVE=0
-                    break
-                fi
-                ;;
-            *) abort_step 4 "host ps could not identify one unique cancellation child after cancellation" ;;
-        esac
         sleep 0.25
     done
-    if [ "$CANCEL_CHILD_IN_GROUP" -eq 0 ]; then
-        if [ "$CANCEL_CHILD_AFTER_LIVE" -eq 1 ]; then
-            if ! terminate_cancel_fixture "$CANCEL_CHILD_AFTER_PID"; then
-                abort_step 4 "escaped cancellation fixture survived and could not be safely stopped from its unique token and workspace cwd"
-            fi
-            CANCEL_CHILD_SURVIVED="yes"
-        else
-            CANCEL_CHILD_SURVIVED="no"
-        fi
-    elif [ "$CANCEL_CHILD_AFTER_LIVE" -eq 1 ]; then
-        abort_step 4 "the child found in recorded PGID $CANCEL_PGID and SID $CANCEL_PGID survived cancellation"
-    fi
-    if [ "$CANCEL_RC" -ne 3 ] && [ -z "$CANCEL_STATUS_ERROR" ]; then
-        CANCEL_STATUS_ERROR="cancel returned $CANCEL_RC instead of confirming cancellation"
-    fi
-    if [ -z "$CANCEL_STATUS_ERROR" ] && \
-            { [ "$(json_value state "$CANCEL_JSON")" != "cancelled" ] \
-                || [ -z "$(json_value cancel_confirmed_at "$CANCEL_JSON")" ] \
-                || [ "$(printf '%s\n' "$CANCEL_JSON" | "$PYTHON" -c \
-                    'import json,sys; attempts=json.load(sys.stdin).get("attempts") or []; print(str(bool(attempts and attempts[-1].get("cleanup_confirmed"))))')" != "True" ]; }; then
-        CANCEL_STATUS_ERROR="relay status did not prove confirmed cancellation and attempt cleanup"
-    fi
-    if [ -z "$CANCEL_STATUS_ERROR" ]; then
-        CANCEL_FINAL_PGID="$(printf '%s\n' "$CANCEL_JSON" | "$PYTHON" -c \
-            'import json,sys; attempts=json.load(sys.stdin).get("attempts") or []; value=(attempts[-1].get("group_pgid") if attempts else None); print("" if value is None else str(value))')"
-        if [ -z "$CANCEL_FINAL_PGID" ] || [ "$CANCEL_FINAL_PGID" != "$CANCEL_PGID" ]; then
-            CANCEL_STATUS_ERROR="cancelled job status did not retain the pre-cancellation PGID $CANCEL_PGID"
-        fi
-    fi
-    PENDING_JOB_ID=""
-    if [ -n "$CANCEL_STATUS_ERROR" ]; then
-        abort_step 4 "$CANCEL_STATUS_ERROR"
-    fi
-    if [ -n "$CANCEL_PRECHECK_FAILURE" ]; then
-        abort_step 4 "$CANCEL_PRECHECK_FAILURE"
-    fi
-    if [ "$CANCEL_CHILD_IN_GROUP" -eq 0 ]; then
-        set_step 4 "KNOWN GAP (backend tool child left the managed group; survived=$CANCEL_CHILD_SURVIVED)"
-        if [ "$CANCEL_CHILD_SURVIVED" = "yes" ]; then
-            if [ "$CANCEL_CLEANUP_METHOD" = "already exited" ]; then
-                printf 'KNOWN GAP: backend tool child left the managed group; survived=yes; it exited before a cleanup signal was needed.\n'
-            else
-                printf 'KNOWN GAP: backend tool child left the managed group; survived=yes; stopped the escaped fixture with %s after verifying its unique token and cwd inside %s.\n' \
-                    "$CANCEL_CLEANUP_METHOD" "$WORKSPACE_REAL"
-            fi
-        else
-            printf 'KNOWN GAP: backend tool child left the managed group; survived=no.\n'
-        fi
+    if [ "$CANCEL_CHILD_FOUND" -ne 1 ]; then
+        CANCEL_RC=0
+        "$PYTHON" "$RELAY_JOB" --state-dir "$STATE_DIR" cancel "$CANCEL_ID" --timeout 20 \
+            >"$RUN_ROOT/live-cancel.unstarted-cancel.stdout" 2>"$RUN_ROOT/live-cancel.unstarted-cancel.stderr" \
+            || CANCEL_RC=$?
+        CANCEL_JSON="$(status_json "$CANCEL_ID")" || abort_step 4 "could not read status after stopping the unstarted fixture"
+        CANCEL_STATE="$(json_value state "$CANCEL_JSON")"
+        case "$CANCEL_STATE" in
+            cancelled)
+                if [ -z "$(json_value cancel_confirmed_at "$CANCEL_JSON")" ] \
+                        || [ "$(printf '%s\n' "$CANCEL_JSON" | "$PYTHON" -c \
+                            'import json,sys; attempts=json.load(sys.stdin).get("attempts") or []; print(str(bool(attempts and attempts[-1].get("cleanup_confirmed"))))')" != "True" ]; then
+                    abort_step 4 "relay did not confirm cleanup of the unstarted cancellation fixture"
+                fi
+                ;;
+            done|failed|crashed)
+                ;;
+            *)
+                abort_step 4 "cancellation fixture never started and relay could not stop its job (cancel exit $CANCEL_RC, state $CANCEL_STATE)"
+                ;;
+        esac
+        PENDING_JOB_ID=""
+        set_step 4 "SKIP (fixture never started)"
+        printf 'SKIP: cancellation child token was never found in host ps before the job ended or the 120-second deadline.\n'
     else
-        set_step 4 "PASS"
-        printf 'PASS: host-visible child PID %s was in recorded PGID and SID %s before cancellation and was gone afterward.\n' \
-            "$CANCEL_CHILD_PID" "$CANCEL_PGID"
+        CANCEL_PRECHECK_FAILURE=""
+        CANCEL_PGID=""
+        verify_deadline=$((SECONDS + 10))
+        while [ "$SECONDS" -lt "$verify_deadline" ]; do
+            CANCEL_RUNNING_JSON="$(status_json "$CANCEL_ID")" || CANCEL_RUNNING_JSON=""
+            if [ -n "$CANCEL_RUNNING_JSON" ]; then
+                CANCEL_STATE="$(json_value state "$CANCEL_RUNNING_JSON")"
+                CANCEL_PGID="$(json_value group_pgid "$CANCEL_RUNNING_JSON")"
+                if [ -n "$CANCEL_PGID" ] && [ "$CANCEL_STATE" = "running" ]; then
+                    break
+                fi
+                case "$CANCEL_STATE" in
+                    done|failed|cancelled|crashed|ownership_unresolved)
+                        break
+                        ;;
+                esac
+            fi
+            sleep 0.1
+        done
+        if [ -z "$CANCEL_PGID" ] || [ "$CANCEL_STATE" != "running" ]; then
+            CANCEL_PRECHECK_FAILURE="the host-visible child had no live recorded process group before cancellation"
+        fi
+        if [ -n "$CANCEL_PGID" ] && [ "$CANCEL_STATE" = "running" ] \
+                && [ "$CANCEL_CHILD_PGID" = "$CANCEL_PGID" ] \
+                && [ "$CANCEL_CHILD_SID" = "$CANCEL_PGID" ]; then
+            CANCEL_CHILD_IN_GROUP=1
+        else
+            CANCEL_CHILD_IN_GROUP=0
+        fi
+        CANCEL_RC=0
+        "$PYTHON" "$RELAY_JOB" --state-dir "$STATE_DIR" cancel "$CANCEL_ID" --timeout 20 \
+            || CANCEL_RC=$?
+        CANCEL_STATUS_ERROR=""
+        CANCEL_JSON="$(status_json "$CANCEL_ID")" || CANCEL_STATUS_ERROR="could not read cancelled job status"
+        CANCEL_CHILD_AFTER_LIVE=0
+        CANCEL_CHILD_AFTER_PID=""
+        deadline=$((SECONDS + 15))
+        while [ "$SECONDS" -lt "$deadline" ]; do
+            find_cancel_child
+            FIND_CANCEL_RC=$?
+            case "$FIND_CANCEL_RC" in
+                1) break ;;
+                0)
+                    printf '%s\n' "$CANCEL_PS_LISTING" >"$RUN_ROOT/live-cancel.ps.after"
+                    if process_is_live "$CANCEL_CHILD_PID"; then
+                        CANCEL_CHILD_AFTER_LIVE=1
+                        CANCEL_CHILD_AFTER_PID="$CANCEL_CHILD_PID"
+                        if [ "$CANCEL_CHILD_IN_GROUP" -eq 0 ]; then
+                            break
+                        fi
+                    else
+                        CANCEL_CHILD_AFTER_LIVE=0
+                        break
+                    fi
+                    ;;
+                *) abort_step 4 "host ps could not identify one unique cancellation child after cancellation" ;;
+            esac
+            sleep 0.25
+        done
+        if [ "$CANCEL_CHILD_IN_GROUP" -eq 0 ]; then
+            if [ "$CANCEL_CHILD_AFTER_LIVE" -eq 1 ]; then
+                if ! terminate_cancel_fixture "$CANCEL_CHILD_AFTER_PID"; then
+                    abort_step 4 "escaped cancellation fixture survived and could not be safely stopped from its unique token and workspace cwd"
+                fi
+                CANCEL_CHILD_SURVIVED="yes"
+            else
+                CANCEL_CHILD_SURVIVED="no"
+            fi
+        elif [ "$CANCEL_CHILD_AFTER_LIVE" -eq 1 ]; then
+            abort_step 4 "the child found in recorded PGID $CANCEL_PGID and SID $CANCEL_PGID survived cancellation"
+        fi
+        if [ "$CANCEL_RC" -ne 3 ] && [ -z "$CANCEL_STATUS_ERROR" ]; then
+            CANCEL_STATUS_ERROR="cancel returned $CANCEL_RC instead of confirming cancellation"
+        fi
+        if [ -z "$CANCEL_STATUS_ERROR" ] && \
+                { [ "$(json_value state "$CANCEL_JSON")" != "cancelled" ] \
+                    || [ -z "$(json_value cancel_confirmed_at "$CANCEL_JSON")" ] \
+                    || [ "$(printf '%s\n' "$CANCEL_JSON" | "$PYTHON" -c \
+                        'import json,sys; attempts=json.load(sys.stdin).get("attempts") or []; print(str(bool(attempts and attempts[-1].get("cleanup_confirmed"))))')" != "True" ]; }; then
+            CANCEL_STATUS_ERROR="relay status did not prove confirmed cancellation and attempt cleanup"
+        fi
+        if [ -z "$CANCEL_STATUS_ERROR" ]; then
+            CANCEL_FINAL_PGID="$(printf '%s\n' "$CANCEL_JSON" | "$PYTHON" -c \
+                'import json,sys; attempts=json.load(sys.stdin).get("attempts") or []; value=(attempts[-1].get("group_pgid") if attempts else None); print("" if value is None else str(value))')"
+            if [ -z "$CANCEL_FINAL_PGID" ] || [ "$CANCEL_FINAL_PGID" != "$CANCEL_PGID" ]; then
+                CANCEL_STATUS_ERROR="cancelled job status did not retain the pre-cancellation PGID $CANCEL_PGID"
+            fi
+        fi
+        PENDING_JOB_ID=""
+        if [ -n "$CANCEL_STATUS_ERROR" ]; then
+            abort_step 4 "$CANCEL_STATUS_ERROR"
+        fi
+        if [ -n "$CANCEL_PRECHECK_FAILURE" ]; then
+            abort_step 4 "$CANCEL_PRECHECK_FAILURE"
+        fi
+        if [ "$CANCEL_CHILD_IN_GROUP" -eq 0 ]; then
+            set_step 4 "KNOWN GAP (backend tool child left the managed group; survived=$CANCEL_CHILD_SURVIVED)"
+            if [ "$CANCEL_CHILD_SURVIVED" = "yes" ]; then
+                if [ "$CANCEL_CLEANUP_METHOD" = "already exited" ]; then
+                    printf 'KNOWN GAP: backend tool child left the managed group; survived=yes; it exited before a cleanup signal was needed.\n'
+                else
+                    printf 'KNOWN GAP: backend tool child left the managed group; survived=yes; stopped the escaped fixture with %s after verifying its unique token and cwd inside %s.\n' \
+                        "$CANCEL_CLEANUP_METHOD" "$WORKSPACE_REAL"
+                fi
+            else
+                printf 'KNOWN GAP: backend tool child left the managed group; survived=no.\n'
+            fi
+        else
+            set_step 4 "PASS"
+            printf 'PASS: host-visible child PID %s was in recorded PGID and SID %s before cancellation and was gone afterward.\n' \
+                "$CANCEL_CHILD_PID" "$CANCEL_PGID"
+        fi
     fi
 fi
 
@@ -1055,6 +1800,8 @@ if [ "$BACKEND" = "codex" ]; then
     printf 'Codex event evidence: %s\n' "$EVENT_LOG"
     cat "$EVENT_LOG"
     set_step 6 "PASS"
+elif [ "$BACKEND" = "claude" ]; then
+    check_claude_event_shape
 else
     set_step 6 "SKIP (Codex backend only)"
     printf 'SKIP: Codex JSONL evidence applies only to Codex runs.\n'
@@ -1100,6 +1847,11 @@ else
             'import json,sys; rows=json.load(sys.stdin).get("notifications") or []; row=next((item for item in rows if item.get("transport")=="codex-queue"),{}); print(row.get("last_error") or "")')"
         abort_step 7 "Codex queue status was ${NOTIFY_STATE:-missing}: ${NOTIFY_ERROR:-no status row}"
     fi
+fi
+
+if [ "$BACKEND" = "claude" ]; then
+    step_start 8
+    run_claude_git_step
 fi
 
 printf '\nLive evidence retained at %s\n' "$RUN_ROOT"

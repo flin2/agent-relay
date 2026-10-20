@@ -37,6 +37,8 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_lifecycle.py'
       - name: Run Codex adapter event and continuation tests
         run: python3 -m unittest discover -s tests -p 'test_codex.py'
+      - name: Run Claude adapter event, route, and continuation tests
+        run: python3 -m unittest discover -s tests -p 'test_claude.py'
       - name: Run host state and continuation tests
         run: python3 -m unittest discover -s tests -p 'test_hosts.py'
       - name: Run Codex notification tests

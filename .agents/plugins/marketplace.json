@@ -6,8 +6,8 @@
   "plugins": [
     {
       "name": "agent-relay",
-      "description": "Manage detached jobs from Claude Code or Codex through OpenCode or Codex CLI backends, with durable status, collection, cancellation, and exact-session continuation.",
-      "version": "0.1.0",
+      "description": "Manage detached jobs from Claude Code or Codex through OpenCode, Codex CLI, or Claude Code CLI backends, with durable status, collection, cancellation, and exact-session continuation.",
+      "version": "0.2.0",
       "source": {
         "source": "local",
         "path": "./plugins/agent-relay"

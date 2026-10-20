@@ -32,6 +32,36 @@ def load_helper(name):
 JOB = load_helper('relay-job')
 SESSION = load_helper('oc-session')
 
+# Per-test Claude stub: records the variables the job received and emits a successful stream.
+CLAUDE_HOST_STUB = r'''#!/bin/sh
+session_id=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--session-id" ] || [ "$previous" = "--resume" ]; then session_id="$arg"; fi
+  previous="$arg"
+done
+cat > /dev/null
+: > "${RELAY_STUB_CLAUDE_ENV_FILE:?}"
+for name in CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_CODE_OAUTH_TOKEN CLAUDE_PLUGIN_DATA PLUGIN_DATA CODEX_THREAD_ID CODEX_SESSION_ID CODEX_HOME OPENAI_API_KEY ANTHROPIC_API_KEY RELAY_JOB_HOST RELAY_JOB_CONVERSATION_ID RELAY_JOB_STATE_DIR RELAY_JOB_ENV_LEAK_TEST; do
+  printf '%s=%s\n' "$name" "$(printenv "$name" || printf '<unset>')" >> "$RELAY_STUB_CLAUDE_ENV_FILE"
+done
+printf '{"type":"system","subtype":"init","session_id":"%s","apiKeySource":"ANTHROPIC_API_KEY"}\n' "$session_id"
+printf '{"type":"result","subtype":"success","is_error":false,"result":"claude host fixture","terminal_reason":"completed","session_id":"%s","api_error_status":null}\n' "$session_id"
+exit 0
+'''
+
+# Wrappers that record CLAUDECODE as seen by the OpenCode and Codex processes, then delegate.
+OPENCODE_WRAPPER = r'''#!/bin/sh
+printf 'CLAUDECODE=%s\n' "${CLAUDECODE-<unset>}" > "${RELAY_STUB_OPENCODE_ENV_FILE:?}"
+exec "__DELEGATE__" "$@"
+'''
+CODEX_WRAPPER = r'''#!/bin/sh
+if [ "$1" = "queue" ]; then
+  printf 'CLAUDECODE=%s\n' "${CLAUDECODE-<unset>}" > "${RELAY_STUB_CODEX_ENV_FILE:?}"
+fi
+exec "__DELEGATE__" "$@"
+'''
+
 
 class RelayTests(unittest.TestCase):
     def setUp(self):
@@ -504,6 +534,86 @@ class RelayTests(unittest.TestCase):
         result = self.run_command('resume', parent, '--stdin', task='follow-up\n')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('workspace is missing', result.stderr)
+
+    def test_claude_backend_strips_foreign_markers_while_opencode_and_codex_queue_keep_them(self):
+        # The Codex process checked here is the queue notification, not a Codex execution job;
+        # Codex execution coverage lives in test_codex.py.
+        wrapper_dir = self.root / 'wrapper-bin'
+        wrapper_dir.mkdir()
+        claude_env = self.root / 'claude-backend-env.txt'
+        opencode_env = self.root / 'opencode-wrapper-env.txt'
+        codex_env = self.root / 'codex-wrapper-env.txt'
+        claude_stub = wrapper_dir / 'claude'
+        claude_stub.write_text(CLAUDE_HOST_STUB, encoding='utf-8')
+        claude_stub.chmod(0o700)
+        codex_wrapper = wrapper_dir / 'codex'
+        codex_wrapper.write_text(
+            CODEX_WRAPPER.replace('__DELEGATE__', str(self.bin_dir / 'codex')), encoding='utf-8',
+        )
+        codex_wrapper.chmod(0o700)
+        oc_wrapper = wrapper_dir / 'oc-sub-wrapper.sh'
+        oc_wrapper.write_text(
+            OPENCODE_WRAPPER.replace('__DELEGATE__', str(self.backend)), encoding='utf-8',
+        )
+        oc_wrapper.chmod(0o700)
+        path = str(wrapper_dir) + os.pathsep + self.base_env['PATH']
+
+        claude_environment = dict(
+            self.base_env, RELAY_JOB_HOST='claude', RELAY_JOB_CONVERSATION_ID='claude-host-conversation',
+            RELAY_JOB_ENV_LEAK_TEST='must-not-reach-backend',
+            CLAUDECODE='foreign-claude-marker', CLAUDE_CODE_ENTRYPOINT='foreign-entrypoint',
+            CLAUDE_CODE_SESSION_ID='foreign-claude-session', CLAUDE_CODE_OAUTH_TOKEN='fixture-oauth',
+            CLAUDE_PLUGIN_DATA='/fixture/claude-data', PLUGIN_DATA='/fixture/plugin-data',
+            CODEX_THREAD_ID='foreign-codex-thread', CODEX_SESSION_ID='foreign-codex-session',
+            ANTHROPIC_API_KEY='fixture-provider-key', PATH=path,
+            RELAY_STUB_CLAUDE_ENV_FILE=str(claude_env),
+        )
+        launch = self.run_command(
+            'run', '--backend', 'claude', '--route', 'api', '--stdin',
+            env=claude_environment, task='claude host task\n',
+        )
+        self.assertEqual(launch.returncode, 0, launch.stderr)
+        job_id = launch.stdout.strip()
+        self.pending.add(job_id)
+        waited = self.run_command(
+            'wait', job_id, '--timeout', '10', '--interval', '0.05', '--claude-waiter',
+            env=claude_environment,
+        )
+        self.assertEqual(waited.returncode, 0, waited.stderr)
+        self.pending.remove(job_id)
+        metadata = self.read_meta(job_id)
+        self.assertEqual((metadata['backend'], metadata['host']), ('claude', 'claude'))
+        captured = dict(line.split('=', 1) for line in claude_env.read_text().splitlines())
+        for key in (
+            'CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_OAUTH_TOKEN',
+            'CLAUDE_PLUGIN_DATA', 'PLUGIN_DATA', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID',
+            'RELAY_JOB_HOST', 'RELAY_JOB_CONVERSATION_ID', 'RELAY_JOB_STATE_DIR',
+            'RELAY_JOB_ENV_LEAK_TEST',
+        ):
+            self.assertEqual(captured[key], '<unset>', key)
+        self.assertEqual(captured['ANTHROPIC_API_KEY'], 'fixture-provider-key')
+        output = self.run_command('result', job_id, env=claude_environment)
+        self.assertEqual(output.stdout, 'claude host fixture')
+
+        # OpenCode and the Codex queue process must still receive the Claude marker.
+        opencode_environment = dict(
+            self.base_env, RELAY_JOB_HOST='codex', RELAY_JOB_CONVERSATION_ID='codex-queue-conversation',
+            CLAUDECODE='foreign-claude-marker', PATH=path,
+            OC_RELAY_SUB_SCRIPT=str(oc_wrapper),
+            RELAY_STUB_OPENCODE_ENV_FILE=str(opencode_env),
+            RELAY_STUB_CODEX_ENV_FILE=str(codex_env),
+        )
+        _, _, opencode_output = self.launch_and_collect(
+            opencode_environment, 'opencode task\n', route='sub',
+        )
+        self.assertEqual(opencode_output, 'opencode task\n')
+        opencode_captured = dict(line.split('=', 1) for line in opencode_env.read_text().splitlines())
+        self.assertEqual(opencode_captured['CLAUDECODE'], 'foreign-claude-marker')
+        deadline = time.monotonic() + 10
+        while not codex_env.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(codex_env.exists(), 'Codex queue process was not invoked')
+        self.assertEqual(codex_env.read_text().strip(), 'CLAUDECODE=foreign-claude-marker')
 
     def test_wait_exit_codes(self):
         missing = self.run_command('wait', 'relay-unknown')

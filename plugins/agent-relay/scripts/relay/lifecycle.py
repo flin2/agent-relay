@@ -35,6 +35,8 @@ HOST_CONTEXT_KEYS = frozenset((
 CODEX_QUEUE_TRANSPORT = 'codex-queue'
 CLAUDE_WAITER_TRANSPORT = 'claude-waiter'
 CODEX_QUEUE_TIMEOUT = 30.0
+# Group membership must not depend on the job's PATH, which may be empty or hostile.
+PS_EXECUTABLE = '/bin/ps'
 NOTIFICATION_ERROR_LIMIT = 1000
 RECONCILIATION_NOTIFICATION_ERROR = (
     'Reconciliation recorded this terminal outcome without a notification sender; '
@@ -799,7 +801,7 @@ def _ps_group_members(pgid):
     own_pid = os.getpid()
     try:
         own = subprocess.run(
-            ['ps', '-o', 'pid=', '-p', str(own_pid)],
+            [PS_EXECUTABLE, '-o', 'pid=', '-p', str(own_pid)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
         own_fields = own.stdout.decode('ascii').split()
@@ -807,7 +809,7 @@ def _ps_group_members(pgid):
                 or int(own_fields[0]) != own_pid):
             return None
         result = subprocess.run(
-            ['ps', '-A', '-o', 'pid=', '-o', 'pgid=', '-o', 'stat='],
+            [PS_EXECUTABLE, '-A', '-o', 'pid=', '-o', 'pgid=', '-o', 'stat='],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
     except (OSError, ValueError):
@@ -942,6 +944,15 @@ def _send_leader_status(status_fd, result):
         _send_status(status_fd, 'LEADER_STATUS exit={}'.format(result['exit_code']))
     else:
         _send_status(status_fd, 'LEADER_STATUS signal={}'.format(result.get('exit_signal')))
+
+
+def _drain_exec_error(fd):
+    """Return a queued exec error from a non-blocking pipe, or '' without waiting."""
+    try:
+        data = os.read(fd, 65536)
+    except BlockingIOError:
+        return ''
+    return data.decode('utf-8', 'replace').replace('\n', ' ')
 
 
 def _cleanup_owned_group(pgid, group_key, child, status_fd, grace=5.0, request_kind=None,
@@ -1171,6 +1182,8 @@ def guard(job_id, control_fd, status_fd, invocation_path):
                 if key.startswith('RELAY_JOB_') or key in HOST_CONTEXT_KEYS:
                     continue
                 env[key] = str(value)
+            for key in invocation.get('env_remove') or ():
+                env.pop(key, None)
             stdin_stream = open(invocation['stdin_path'], 'rb') if invocation.get('stdin_path') else None
             stdout_fd = os.open(paths['stdout'], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             stderr_fd = os.open(paths['stderr'], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -1313,6 +1326,14 @@ def guard(job_id, control_fd, status_fd, invocation_path):
                 _send_status(status_fd, 'LEADER_EXIT_OBSERVED')
                 _fault('guard_after_leader_exit')
             if leader_status is not None or signal_request['requested']:
+                if leader_status is not None and exec_error_read is not None:
+                    # The trampoline writes any exec failure before it exits, so an observed
+                    # exit already has its message queued.
+                    error = _drain_exec_error(exec_error_read)
+                    os.close(exec_error_read)
+                    exec_error_read = None
+                    if error:
+                        _send_status(status_fd, 'SPAWN_ERROR {}'.format(error))
                 leader_status, _, _, confirmed = _cleanup_owned_group(
                     group_pgid, group_proc_key, child, status_fd,
                     observer=leader_observer,
@@ -1743,6 +1764,7 @@ def supervise(root, job_id, supervisor_lock_fd=None, guard_command_builder=None)
             'argv': list(invocation_value.argv),
             'cwd': invocation_value.cwd,
             'env_overrides': dict(invocation_value.env_overrides or {}),
+            'env_remove': list(invocation_value.env_remove or ()),
             'stdin_path': invocation_value.stdin_path,
         }
         attempt_index = 1
@@ -2215,6 +2237,7 @@ def supervise(root, job_id, supervisor_lock_fd=None, guard_command_builder=None)
                     'argv': list(next_invocation.argv),
                     'cwd': next_invocation.cwd,
                     'env_overrides': dict(next_invocation.env_overrides or {}),
+                    'env_remove': list(next_invocation.env_remove or ()),
                     'stdin_path': next_invocation.stdin_path,
                 }
                 attempt_index += 1

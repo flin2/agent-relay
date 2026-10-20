@@ -95,10 +95,12 @@ def _emit_handoff(job_id, job, state_root, inline=False):
     wait_command = _collection_command(state_root, job_id, 'wait', host=job.get('host'))
     result_command = _collection_command(state_root, job_id, 'result')
     cancel_command = _collection_command(state_root, job_id, 'cancel')
+    route_text = job.get('route') or '(none)'
+    if (job.get('options') or {}).get('route_defaulted') is True:
+        route_text = '{} (default)'.format(route_text)
     sys.stderr.write(
         '[agent-relay] launched {}: {} (backend={}, route={})\n'.format(
-            'inline' if inline else 'detached', job_id, job.get('backend'),
-            job.get('route') or '(none)',
+            'inline' if inline else 'detached', job_id, job.get('backend'), route_text,
         )
         + '[agent-relay] state root: {}\n'.format(state_root)
         + '[agent-relay] wait: {}\n'.format(wait_command)
@@ -194,8 +196,8 @@ def _run_wait(job_id, db, inline=False, timeout=None, interval=0.25):
 
 
 def cmd_run(raw_args):
-    parser = _arg_parser('relay-job.py run', 'Launch a detached OpenCode or Codex adapter job.')
-    parser.add_argument('--backend', required=True, choices=('opencode', 'codex'))
+    parser = _arg_parser('relay-job.py run', 'Launch a detached OpenCode, Codex, or Claude adapter job.')
+    parser.add_argument('--backend', required=True, choices=('opencode', 'codex', 'claude'))
     parser.add_argument('--route', choices=('sub', 'api'))
     parser.add_argument('--zen', action='store_true')
     parser.add_argument('--go', action='store_true')
@@ -215,6 +217,8 @@ def cmd_run(raw_args):
         raise ValueError('choose only one of --wait or --background')
     if args.backend == 'codex' and (args.route or args.zen or args.go):
         raise ValueError('OpenCode-only flags --route, --zen, and --go cannot be used with --backend codex')
+    if args.backend == 'claude' and (args.zen or args.go):
+        raise ValueError('OpenCode-only flags --zen and --go cannot be used with --backend claude')
     if args.zen and args.go:
         raise ValueError('choose only one of --zen or --go')
     gateway = 'go' if args.go else ('zen' if args.zen else None)
@@ -236,6 +240,7 @@ def cmd_run(raw_args):
         'title': _session_title(args.label, task_text) if args.backend == 'opencode' else None,
     }
     options = adapter.validate(options)
+    options = adapter.resolve_launch(options)
     root = lifecycle._ensure_state_root(lifecycle._resolve_state_root())
     job = _job_fields(options)
     job_id = lifecycle.launch(root, job, task_text)
@@ -725,10 +730,10 @@ def _compat_write_meta(job_dir, job):
 
 
 def _print_help():
-    print('''relay-job.py — shared SQLite job manager for OpenCode and Codex adapters.
+    print('''relay-job.py — shared SQLite job manager for OpenCode, Codex, and Claude adapters.
 
 Usage:
-    relay-job.py [--state-dir PATH] run --backend {opencode|codex} [--route {sub|api}] [options] (task text | --task-file PATH | --stdin)
+    relay-job.py [--state-dir PATH] run --backend {opencode|codex|claude} [--route {sub|api}] [options] (task text | --task-file PATH | --stdin)
     relay-job.py [--state-dir PATH] resume JOB_ID [options] (task text | --task-file PATH | --stdin)
     relay-job.py [--state-dir PATH] status [JOB_ID] [--all] [--dir PATH] [--json]
     relay-job.py [--state-dir PATH] result JOB_ID [--stderr|--events]
@@ -740,22 +745,23 @@ Usage:
 Global options:
     --state-dir PATH              absolute state root; overrides RELAY_JOB_STATE_DIR
 
-Both the OpenCode and Codex backends use the shared detached lifecycle.'''.rstrip())
+The OpenCode, Codex, and Claude backends use the shared detached lifecycle.'''.rstrip())
 
 
 def _print_run_help():
     print('''relay-job.py run — launch a detached adapter job.
 
 Required:
-    --backend opencode|codex
-    --route sub|api                 required for --backend opencode
+    --backend opencode|codex|claude
+    --route sub|api                 required for --backend opencode; optional for claude,
+                                    which defaults per login (sub, else api with ANTHROPIC_API_KEY)
 
 Shared options:
     --stdin | --task-file PATH     provide task text without shell quoting
     --dir PATH                     working directory (default: current directory)
     --label TEXT                   label shown in job listings
     --model MODEL                  backend model or model ID
-    --effort VALUE                 backend effort setting where supported
+    --effort VALUE                 backend effort setting where supported (claude: low|medium|high|xhigh|max)
     --write                        allow edits (default: read-only)
     --wait | --background          wait for the detached job or return its ID
 

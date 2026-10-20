@@ -9,5 +9,5 @@ Use the explicit job ID supplied by the user or recorded in the conversation:
 RELAY_JOB_HOST=codex python3 "<plugin-root>/scripts/relay-job.py" result "<job-id>" [--stderr|--events]
 ```
 
-Return the selected artifact verbatim. The default selects the final response when available, else partial stdout with a label on stderr. `--stderr` selects diagnostics and `--events` selects the event artifact. OpenCode text output does not produce a separate structured event stream. Use the state root from the handoff for collection. Do not relaunch the task or claim partial output is a completed result.
+Return the selected artifact verbatim. The default selects the final response when available, else partial stdout with a label on stderr. `--stderr` selects diagnostics and `--events` selects the event artifact. OpenCode text output does not produce a separate structured event stream. Claude jobs use the same collection commands and artifacts. Use the state root from the handoff for collection. Do not relaunch the task or claim partial output is a completed result.
 

@@ -1,7 +1,7 @@
 {
   "name": "agent-relay",
-  "version": "0.1.0",
-  "description": "Delegate bounded tasks from Claude Code through OpenCode or the Codex CLI execution backend, using the shared durable job manager.",
+  "version": "0.2.0",
+  "description": "Delegate bounded tasks from Claude Code through OpenCode, Codex CLI, or Claude Code CLI execution backends, using the shared durable job manager.",
   "author": {
     "name": "Feng Lin"
   },

@@ -4,7 +4,25 @@
 
 Jobs default to backend-specific read-only modes. Codex uses its sandbox (`--sandbox read-only` for new jobs and `sandbox_mode="read-only"` for resumed jobs), which enforces read-only access. OpenCode selects the `plan` agent, which avoids edit tools but still permits shell writes unless OpenCode permissions deny them. Configure OpenCode to deny shell for the plan agent when enforcement is required. `--write` enables edits for that job only, and a continuation returns to the backend's read-only mode unless that follow-up explicitly includes `--write`.
 
+Claude read-only jobs use `--safe-mode --restricted --strict-mcp-config` and limit tools to Read, Grep, and Glob. Anything that would prompt is denied.
+
+- Bash is limited to a prefix-matched allow list of read-only Git commands: `status`, `diff`, `log`, `show`, `rev-parse`, `ls-files`, `merge-base`, `blame`, and `branch --show-current`.
+- Deny rules block options that write files or run external programs (`--output`, `--ext-diff`, `--textconv`, `--open-files-in-pager`), redirection, pipes, and command chaining or substitution.
+
+This is application-level enforcement inside Claude Code, not an OS sandbox. Subscription-route live checks on 2026-10-20 confirmed denials for a shell write (`touch`), `git diff --output`, and output redirection on fresh and resumed read-only jobs; other deny rules are not separately verified. Read-only jobs remove inherited Git helper variables such as `GIT_EXTERNAL_DIFF`, but helpers defined in Git configuration files (for example `diff.external` or a textconv driver) can still run programs when an allowed Git command uses them.
+
+`--write` selects `acceptEdits` and loads the user's full Claude configuration, including hooks, plugins, and MCP servers, so a write job runs whatever those configure.
+
 The relay does not turn a read-only job into a write job based on a parent session's settings. Review the task scope and workspace before enabling writes.
+
+## Claude routes and credentials
+
+- Route `sub` uses the Claude subscription login and removes `ANTHROPIC_API_KEY` from the backend environment; route `api` uses `ANTHROPIC_API_KEY` and removes `CLAUDE_CODE_OAUTH_TOKEN`.
+- Both routes remove gateway and third-party provider overrides from the launched process environment.
+- A job fails with `route_mismatch` when Claude reports a credential source that differs from its selected route, for example an `apiKeyHelper` in user settings on the `sub` route.
+- The job checks the reported credential source and, when reported, the provider, which must be first-party. The 2026-10-20 subscription-route check reported a subscription credential and a first-party provider.
+- Write jobs load the full user configuration, so a settings-supplied endpoint override (for example `ANTHROPIC_BASE_URL` in a settings `env` block) or managed settings is not detected. Read-only jobs ignore user settings files.
+- The API-key route has not been verified by live runs.
 
 ## Cancellation
 

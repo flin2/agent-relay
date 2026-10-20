@@ -67,6 +67,7 @@ def main():
         'scripts/oc-model.py',
         'scripts/oc-session.py',
         'scripts/oc-setup.sh',
+        'scripts/claude-setup.sh',
         'commands/setup.md',
         'commands/run.md',
         'commands/review.md',
@@ -78,6 +79,7 @@ def main():
         'agents/relay-opencode-sub.md',
         'agents/relay-opencode-api.md',
         'agents/relay-codex.md',
+        'agents/relay-claude.md',
         'skills/relay-runtime/SKILL.md',
         'skills/relay-prompting/SKILL.md',
         'prompts/review.md',
@@ -88,6 +90,9 @@ def main():
     for relative in required_files:
         if not (PLUGIN / relative).is_file():
             errors.append('missing package file: ' + relative)
+    claude_setup = PLUGIN / 'scripts/claude-setup.sh'
+    if claude_setup.is_file() and not os.access(str(claude_setup), os.X_OK):
+        errors.append('scripts/claude-setup.sh must be executable')
     for relative in ('test_lifecycle.py', 'test_notify.py', 'lifecycle_harness.py'):
         if not (ROOT / 'tests' / relative).is_file():
             errors.append('missing lifecycle test file: ' + relative)
@@ -148,6 +153,40 @@ def main():
         description = json.loads(manifest_path.read_text(encoding='utf-8'))['description'].casefold()
         if 'opencode' not in description or 'codex' not in description:
             errors.append(manifest_path.relative_to(PLUGIN).as_posix() + ': describe both OpenCode and Codex backends')
+
+    # Backend-listing surfaces must name all three backends; this is a presence check on an explicit list, so keep the list in step with files that enumerate backends, and it does not verify the wording of each rule.
+    backend_surfaces = (
+        ROOT / 'README.md',
+        ROOT / 'SECURITY.md',
+        ROOT / '.claude-plugin/marketplace.json',
+        PLUGIN / 'README.md',
+        PLUGIN / '.claude-plugin/plugin.json',
+        PLUGIN / '.codex-plugin/plugin.json',
+        PLUGIN / 'commands/run.md',
+        PLUGIN / 'commands/review.md',
+        PLUGIN / 'commands/adversarial-review.md',
+        PLUGIN / 'commands/resume.md',
+        PLUGIN / 'commands/setup.md',
+        PLUGIN / 'codex-skills/relay-run/SKILL.md',
+        PLUGIN / 'codex-skills/relay-review/SKILL.md',
+        PLUGIN / 'codex-skills/relay-resume/SKILL.md',
+        PLUGIN / 'codex-skills/relay-setup/SKILL.md',
+        PLUGIN / 'codex-skills/relay-result/SKILL.md',
+        PLUGIN / 'skills/relay-runtime/SKILL.md',
+        PLUGIN / 'prompts/codex-runtime.md',
+    )
+    backend_terms = (
+        ('OpenCode', r'\bopencode\b'),
+        ('Codex', r'\bcodex\b'),
+        ('Claude', r'\bclaude\b'),
+    )
+    for surface in backend_surfaces:
+        text = surface.read_text(encoding='utf-8')
+        missing = [name for name, pattern in backend_terms if not re.search(pattern, text, re.IGNORECASE)]
+        if missing:
+            errors.append('{}: backend surface does not name {}'.format(
+                surface.relative_to(ROOT).as_posix(), ', '.join(missing),
+            ))
 
     public = os.environ.get('GITHUB_REF_NAME') == 'main' or os.environ.get('GITHUB_BASE_REF') == 'main'
     if public:
