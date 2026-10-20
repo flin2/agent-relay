@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, main-p, work-p]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: "3.8"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: macos-latest
+            python: "3.12"
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      # The runner context is unavailable in job-level env, so export TMPDIR from a step.
+      - name: Use the runner temporary directory
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run OpenCode wrapper and job smoke checks
+        run: bash tests/smoke.sh
+      - name: Run shared lifecycle and ownership tests
+        run: python3 -m unittest discover -s tests -p 'test_lifecycle.py'
+      - name: Run Codex adapter event and continuation tests
+        run: python3 -m unittest discover -s tests -p 'test_codex.py'
+      - name: Run host state and continuation tests
+        run: python3 -m unittest discover -s tests -p 'test_hosts.py'
+      - name: Run Codex notification tests
+        run: python3 -m unittest discover -s tests -p 'test_notify.py'
+      - name: Validate package metadata and public boundary
+        run: python3 tests/validate-package.py
+      - name: Check shell syntax
+        run: find tests plugins/agent-relay/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+      - name: Install ShellCheck on Linux
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+      - name: ShellCheck package scripts and tests
+        if: runner.os == 'Linux'
+        run: find tests plugins/agent-relay/scripts -type f -name '*.sh' -exec shellcheck --severity=warning {} +
+      - name: Check private release script syntax when present
+        run: |
+          if [ -f _private/publish.sh ]; then
+            bash -n _private/publish.sh
+          fi

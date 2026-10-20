@@ -1,0 +1,4 @@
+# agent-relay's wrappers source `oc-run.sh` and intentionally share variables across that boundary; standalone ShellCheck analysis cannot see the handoff, so SC2034 and SC2154 are false positives for this sourced-fragment pattern.
+# CI runs ShellCheck with --severity=warning to retain warning and error findings while dropping info and style noise.
+disable=SC2034
+disable=SC2154

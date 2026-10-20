@@ -1,0 +1,21 @@
+{
+  "name": "agent-relay",
+  "owner": {
+    "name": "Feng Lin"
+  },
+  "metadata": {
+    "description": "Manage detached jobs from Claude Code or Codex through OpenCode or Codex CLI backends, with durable status, collection, cancellation, and exact-session continuation.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "agent-relay",
+      "description": "Manage detached jobs from Claude Code or Codex through OpenCode or Codex CLI backends, with durable status, collection, cancellation, and exact-session continuation.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Feng Lin"
+      },
+      "source": "./plugins/agent-relay"
+    }
+  ]
+}

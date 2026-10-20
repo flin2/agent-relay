@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / scratch
+*.swp
+*~
+
+# Logs and local job/session state
+log/
+*.log
+*.db
+
+# Defensive: never publish dev scratch dirs
+_dev/
+dev/

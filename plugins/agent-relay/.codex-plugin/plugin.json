@@ -1,0 +1,32 @@
+{
+  "name": "agent-relay",
+  "version": "0.1.0",
+  "description": "Delegate bounded tasks from Codex through OpenCode or the Codex CLI execution backend, using the shared durable job manager.",
+  "author": {
+    "name": "Feng Lin"
+  },
+  "repository": "https://github.com/flin2/agent-relay",
+  "license": "GPL-3.0-or-later",
+  "keywords": [
+    "agent",
+    "delegation",
+    "jobs",
+    "opencode",
+    "codex"
+  ],
+  "skills": "./codex-skills/",
+  "interface": {
+    "displayName": "Agent Relay",
+    "shortDescription": "Delegate through OpenCode or Codex",
+    "longDescription": "Launch, manage, and collect detached jobs from Codex through OpenCode subscription or direct API routes, or through the Codex CLI. The shared manager supports status, result, wait, cancellation, and exact-session continuation.",
+    "developerName": "Feng Lin",
+    "category": "Developer Tools",
+    "capabilities": [
+      "OpenCode jobs through subscription and direct API routes",
+      "Codex CLI jobs with exact-session continuation",
+      "Job status, result, wait, cancellation, and collection"
+    ],
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/icon.svg"
+  }
+}
